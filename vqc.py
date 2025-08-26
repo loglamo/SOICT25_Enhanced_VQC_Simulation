@@ -14,11 +14,12 @@ from torch import nn
 import torch
 import math
 import time
+import pynvml
 
 
 
 num_qubits = 4
-num_layers = 8
+num_layers = 12
 
 #dev = qml.device("default.qubit", wires=num_qubits)
 dev = qml.device("lightning.gpu", wires=num_qubits)
@@ -97,8 +98,8 @@ optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
 criterion = nn.MSELoss()
 
 # prepare minibacth and setup
-file_path = "/home/hpcstudent/lan_workspace/VQC_quantum/VQC/results/qubit4/training_result_vqc_bs1024.csv"
-batch_size = 1024
+file_path = "/home/hpcstudent/lan_workspace/VQC_quantum/VQC/results/qubit4/training_result_vqc_layers12.csv"
+batch_size = 128
 epochs = 20
 def iterate_minibatch(x, y, batch_size, shuffle=True):
     n = x.shape[0]
@@ -110,12 +111,16 @@ def iterate_minibatch(x, y, batch_size, shuffle=True):
         sel = idx[start:end]
         yield x[sel], y[sel]
 
+pynvml.nvmlInit()
+handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+
 start_time = time.time()
 for epoch in range(epochs):
     model.train()
     epoch_loss = 0
     correct = 0
     total = 0
+
 
     for xb_cpu, yb_gpu in iterate_minibatch(X_train, Y_train, batch_size, shuffle=True):
         optimizer.zero_grad()
@@ -143,9 +148,14 @@ for epoch in range(epochs):
     avg_loss = epoch_loss/total
     acc = correct/total
 
-    print(f"Epoch {epoch+1} | Loss: {avg_loss:.6f} | Accuracy: {acc:.4f}")
+    # Utilization
+    util = pynvml.nvmlDeviceGetUtilizationRates(handle)
+    gpu_util = util.gpu
+    mem_util = util.memory
+
+    print(f"Epoch {epoch+1} | Loss: {avg_loss:.6f} | Accuracy: {acc:.4f} | GPU_util: {gpu_util}% | Mem_util: {mem_util}%")
     with open(file_path, 'a') as f:
-        f.write(f"{epoch}, {avg_loss}, {acc}\n");
+        f.write(f"{epoch}, {avg_loss}, {acc}, {gpu_util}, {mem_util}\n");
     print("Done writing to file\n")
 
 end_time = time.time()

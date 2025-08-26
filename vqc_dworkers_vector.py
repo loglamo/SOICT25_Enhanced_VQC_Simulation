@@ -14,19 +14,24 @@ from torch import nn
 import torch
 import math
 import time
-import pynvml
+
 
 
 num_qubits = 4
-num_layers = 12
+num_layers = 8
+num_vlanes = 16
 
-#dev = qml.device("default.qubit", wires=num_qubits)
-dev = qml.device("lightning.gpu", wires=num_qubits)
+try:
+    dev = qml.device("lightning.gpu", wires=num_qubits, shots=None)
+    print("Using Pennylane device: GPU\n")
+except Exception as e:
+    dev = qml.device("default.qubit", wires=num_qubits, shots=None)
+    print("Falling back to default device: CPU\n")
 
-# quantum circuit functions
+# quantum circuit functions for VEC
 def statepreparation(x):
-    #qml.BasisEmbedding(x, wires=range(0, num_qubits))
-    qml.AngleEmbedding(x, wires=range(num_qubits))
+    #qml.AngleEmbedding(x, wires=range(num_qubits))
+    qml.AngleEmbedding(x, wires=range(num_qubits), rotation='X')
 
 # dynamic layers
 def layer(W):
@@ -40,7 +45,7 @@ def layer(W):
 #@qml.qnode(dev, interface="autograd")
 @qml.qnode(dev, interface="torch", diff_method="adjoint")
 
-def circuit(weights, x):
+def circuit(weights, x): #Vectorized QNode
 
     statepreparation(x)
 
@@ -50,21 +55,34 @@ def circuit(weights, x):
     return qml.expval(qml.PauliZ(0))
 
 
-# Define class of VQC
+# Define class of VQC with vectorized lanes
 class VQC(nn.Module):
-    def __init__(self):
+    def __init__(self, num_layers, num_qubits, vec_lanes):
         super().__init__()
+        self.num_layers = num_layers
+        self.num_qubits = num_qubits
+        self.vec_lanes = vec_lanes
         self.weights = nn.Parameter(0.01*torch.randn((num_layers, num_qubits, 3), dtype=torch.float64))
 
-    def forward(self, x):
-        preds = [circuit(self.weights, xi) for xi in x]
-        return torch.stack(preds)
+
+    def forward(self, x_batch):
+        B = x_batch.shape[0]
+        if x_batch.dtype != torch.float64:
+            x_batch = x_batch.double()
+
+        x_vec_full = x_batch.unsqueeze(1).repeat(1, self.vec_lanes, 1).reshape(-1, self.num_qubits)
+        weights_vec = self.weights
+        y_vec_full = circuit(weights_vec, x_vec_full)
+        y_vec_full = y_vec_full.reshape(B, self.vec_lanes)
+        preds = y_vec_full.mean(dim = 1).unsqueeze(1)
+        #preds = [circuit(self.weights, xi) for xi in x]
+        return preds
 
 
 
 
 # preparaing data
-file_path = '/home/hpcstudent/lan_workspace/VQC_quantum/VQC/results/qubit4/training_result_vqc_dw8_layers12.csv'
+file_path = '/home/hpcstudent/lan_workspace/VQC_quantum/VQC/results/qubit4/training_result_vqc_dw32_vec16.csv'
 df_train = pd.read_csv('/home/hpcstudent/lan_workspace/VQC_quantum/VQC/dataset/train.csv')
 
 df_train['Pclass'] = df_train['Pclass'].astype(str)
@@ -85,14 +103,14 @@ Y_train = np.array(y_train.values * 2 - np.ones(len(y_train)), requires_grad=Fal
 #X_train = torch.Tensor(X_train)
 X_train = X_train.astype(float) #La: X_train is an object
 X_train = torch.from_numpy(X_train).float()
-Y_train = torch.from_numpy(Y_train).long()
+Y_train = torch.from_numpy(Y_train).double().unsqueeze(1)
 dataset = TensorDataset(X_train, Y_train)
 
 
 
 # Setting model and optimizer
 device = torch.device("cuda")
-model = VQC().to(device)
+model = VQC(num_layers=num_layers, num_qubits=num_qubits, vec_lanes=num_vlanes).to(device)
 optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
 criterion = nn.MSELoss()
 
@@ -102,16 +120,14 @@ train_loader = DataLoader(
         dataset,
         batch_size=128,
         shuffle=True,
-        num_workers=8,
+        num_workers=32,
         pin_memory=True,
         prefetch_factor=4,
         persistent_workers=True
         )
 
-pynvml.nvmlInit()
-handle = pynvml.nvmlDeviceGetHandleByIndex(0)
-
 epochs = 20
+
 start_time = time.time()
 for epoch in range(epochs):
     model.train()
@@ -119,36 +135,27 @@ for epoch in range(epochs):
     correct = 0
     total = 0
 
-    #batch_start = time.time()
-    #num_batches = 0
-
     for xb, yb in train_loader:
         xb_cpu, yb_gpu = xb.cpu(), yb.to(device)
         optimizer.zero_grad()
         preds = model(xb_cpu)
-        loss = criterion(preds, yb_gpu.double())
+        loss = criterion(preds, yb_gpu)
         loss.backward()
         optimizer.step()
 
-        epoch_loss += loss.item()*len(yb_gpu.double())
-        pred_labels = torch.sign(preds.detach())
-        correct += (pred_labels == yb_gpu.double()).sum().item()
-        total += len(yb_gpu)
-        #num_batches += 1
+        with torch.no_grad():
+            epoch_loss += loss.item()*xb_cpu.size(0)
+            pred_labels = torch.sign(preds).squeeze(1)
+            true_labels = yb_gpu.squeeze(1)
+            correct += (pred_labels == true_labels).sum().item()
+            total += xb_cpu.size(0)
 
     avg_loss = epoch_loss/total
     acc = correct/total
-    #batch_time = time.time() - batch_start
-    #batches_per_second = num_batches/batch_time
 
-    # Query utilization
-    util = pynvml.nvmlDeviceGetUtilizationRates(handle)
-    gpu_util = util.gpu
-    mem_util = util.memory
-
-    print(f"Epoch {epoch+1} | Loss: {avg_loss:.4f} | Accuracy: {acc:.4f} | GPU_util: {gpu_util}% | Mem_util: {mem_util}%")
+    print(f"Epoch {epoch+1} | Loss: {avg_loss:.4f} | Accuracy: {acc:.4f}")
     with open(file_path, 'a') as f:
-        f.write(f"{epoch}, {avg_loss}, {acc}, {gpu_util}, {mem_util}\n");
+        f.write(f"{epoch}, {avg_loss}, {acc}\n");
     print("Done writing to file\n")
 
 end_time = time.time()
