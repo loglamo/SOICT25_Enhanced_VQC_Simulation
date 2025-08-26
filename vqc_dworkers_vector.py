@@ -14,12 +14,12 @@ from torch import nn
 import torch
 import math
 import time
-
+import pynvml
 
 
 num_qubits = 4
-num_layers = 8
-num_vlanes = 16
+num_layers = 4
+num_vlanes = 64
 
 try:
     dev = qml.device("lightning.gpu", wires=num_qubits, shots=None)
@@ -28,9 +28,10 @@ except Exception as e:
     dev = qml.device("default.qubit", wires=num_qubits, shots=None)
     print("Falling back to default device: CPU\n")
 
-# quantum circuit functions for VEC
+# quantum circuit functions for VEC: Angleenbedding supports batched inputs
 def statepreparation(x):
     #qml.AngleEmbedding(x, wires=range(num_qubits))
+    print("Batched lanes execution\n")
     qml.AngleEmbedding(x, wires=range(num_qubits), rotation='X')
 
 # dynamic layers
@@ -45,9 +46,9 @@ def layer(W):
 #@qml.qnode(dev, interface="autograd")
 @qml.qnode(dev, interface="torch", diff_method="adjoint")
 
-def circuit(weights, x): #Vectorized QNode
+def circuit(weights, x_batch_lanes): #Vectorized QNode
 
-    statepreparation(x)
+    statepreparation(x_batch_lanes)
 
     for W in weights:
         layer(W)
@@ -67,22 +68,16 @@ class VQC(nn.Module):
 
     def forward(self, x_batch):
         B = x_batch.shape[0]
-        if x_batch.dtype != torch.float64:
-            x_batch = x_batch.double()
-
         x_vec_full = x_batch.unsqueeze(1).repeat(1, self.vec_lanes, 1).reshape(-1, self.num_qubits)
-        weights_vec = self.weights
-        y_vec_full = circuit(weights_vec, x_vec_full)
-        y_vec_full = y_vec_full.reshape(B, self.vec_lanes)
-        preds = y_vec_full.mean(dim = 1).unsqueeze(1)
-        #preds = [circuit(self.weights, xi) for xi in x]
+        y_vec_full = circuit(self.weights, x_vec_full)
+        preds = y_vec_full.reshape(B, self.vec_lanes).mean(dim = 1, keepdim=True)
         return preds
 
 
 
 
 # preparaing data
-file_path = '/home/hpcstudent/lan_workspace/VQC_quantum/VQC/results/qubit4/training_result_vqc_dw32_vec16.csv'
+file_path = '/home/hpcstudent/lan_workspace/VQC_quantum/VQC/results/qubit4/training_result_vqc_dw8_vec32.csv'
 df_train = pd.read_csv('/home/hpcstudent/lan_workspace/VQC_quantum/VQC/dataset/train.csv')
 
 df_train['Pclass'] = df_train['Pclass'].astype(str)
@@ -95,18 +90,28 @@ df_train['Age'] = df_train['Age'].fillna(df_train['Age'].median())
 df_train['is_child'] = df_train['Age'].map(lambda x: 1 if x < 12 else 0)
 cols_model = ['is_child', 'Pclass_1', 'Pclass_2', 'Sex_female']
 
-X_train, X_test, y_train, y_test = train_test_split(df_train[cols_model], df_train['Survived'], test_size=0.10, random_state=42, stratify=df_train['Survived'])
+X_train, X_test, Y_train, Y_test = train_test_split(df_train[cols_model], df_train['Survived'], test_size=0.10, random_state=42, stratify=df_train['Survived'])
 
-X_train = np.array(X_train.values, requires_grad=False)
-Y_train = np.array(y_train.values * 2 - np.ones(len(y_train)), requires_grad=False)
+"""
+X = torch.tensor(df_train[cols_model].to_numpy(dtype=float), dtype=torch.float64)
+Y = torch.tensor(df_train['Survived'].to_numpy()*2-1, dtype=torch.float64)
+dataset = TensorDataset(X, Y)
+"""
+#X_train = np.array(X_train.values, requires_grad=False)
+#Y_train = np.array(y_train.values * 2 - np.ones(len(y_train)), requires_grad=False)
 # Create tensor dataset
-#X_train = torch.Tensor(X_train)
-X_train = X_train.astype(float) #La: X_train is an object
+
+X_train = X_train.to_numpy().astype(float) #La: X_train is an object
 X_train = torch.from_numpy(X_train).float()
+Y_train = Y_train.to_numpy().astype(float)
 Y_train = torch.from_numpy(Y_train).double().unsqueeze(1)
 dataset = TensorDataset(X_train, Y_train)
 
-
+"""
+print(f"The number of samples is: {len(dataset)}")
+print(f"Shape of X_train is: {dataset[0][0].shape}")
+print(f"Shape of Y_train is: {dataset[0][1].shape}")
+"""
 
 # Setting model and optimizer
 device = torch.device("cuda")
@@ -118,9 +123,9 @@ criterion = nn.MSELoss()
 # Create DataLoader
 train_loader = DataLoader(
         dataset,
-        batch_size=128,
+        batch_size=64,
         shuffle=True,
-        num_workers=32,
+        num_workers=8,
         pin_memory=True,
         prefetch_factor=4,
         persistent_workers=True
@@ -128,13 +133,17 @@ train_loader = DataLoader(
 
 epochs = 20
 
+
+pynvml.nvmlInit()
+handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+
 start_time = time.time()
 for epoch in range(epochs):
     model.train()
     epoch_loss = 0
     correct = 0
     total = 0
-
+    print(f"Start training in {epoch+1}")
     for xb, yb in train_loader:
         xb_cpu, yb_gpu = xb.cpu(), yb.to(device)
         optimizer.zero_grad()
@@ -143,25 +152,29 @@ for epoch in range(epochs):
         loss.backward()
         optimizer.step()
 
-        with torch.no_grad():
-            epoch_loss += loss.item()*xb_cpu.size(0)
-            pred_labels = torch.sign(preds).squeeze(1)
-            true_labels = yb_gpu.squeeze(1)
-            correct += (pred_labels == true_labels).sum().item()
-            total += xb_cpu.size(0)
+        
+        epoch_loss += loss.item()*xb_cpu.size(0)
+        pred_signs = torch.sign(preds.detach())
+        correct += (pred_signs == yb_gpu).sum().item()
+        total += len(yb_gpu)
 
     avg_loss = epoch_loss/total
     acc = correct/total
 
-    print(f"Epoch {epoch+1} | Loss: {avg_loss:.4f} | Accuracy: {acc:.4f}")
+    util = pynvml.nvmlDeviceGetUtilizationRates(handle)
+    gpu_util = util.gpu
+
+    print(f"Epoch {epoch+1} | Loss: {avg_loss:.4f} | Accuracy: {acc:.4f} | GPU_utilization: {gpu_util}")
     with open(file_path, 'a') as f:
-        f.write(f"{epoch}, {avg_loss}, {acc}\n");
+        f.write(f"{epoch}, {avg_loss}, {acc}, {gpu_util}\n");
     print("Done writing to file\n")
 
 end_time = time.time()
 elapsed = end_time - start_time
 training_speed = elapsed/epochs
 print(f"Training speed is {training_speed}")
+
+
 '''
 X_test = np.array(X_test.values, requires_grad=False)
 Y_test = np.array(y_test.values * 2 - np.ones(len(y_test)), requires_grad=False)
